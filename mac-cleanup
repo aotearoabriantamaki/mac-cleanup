@@ -274,9 +274,11 @@ cleanup_simulators() {
     command -v xcrun >/dev/null 2>&1 || return
 
     # Check for unavailable simulators
-    local unavailable=$(xcrun simctl list devices unavailable 2>/dev/null | grep -c "unavailable" || echo "0")
+    local unavailable
+    unavailable=$(xcrun simctl list devices unavailable 2>/dev/null | grep -c "unavailable" 2>/dev/null) || unavailable=0
+    [[ -z "$unavailable" ]] && unavailable=0
 
-    [[ $unavailable -eq 0 ]] && return
+    [[ "$unavailable" -eq 0 ]] && return
 
     local sim_cache="$HOME/Library/Developer/CoreSimulator/Caches"
     local size_bytes=0
@@ -309,9 +311,11 @@ cleanup_old_downloads() {
 
     # Find files older than 30 days
     local old_files=$(find "$downloads" -maxdepth 1 -type f -mtime +30 2>/dev/null)
-    local count=$(echo "$old_files" | grep -c "." || echo "0")
+    [[ -z "$old_files" ]] && return
 
-    [[ $count -eq 0 || -z "$old_files" ]] && return
+    local count
+    count=$(echo "$old_files" | wc -l | tr -d ' ')
+    [[ -z "$count" || "$count" -eq 0 ]] && return
 
     # Calculate size
     local size_bytes=0
