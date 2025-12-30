@@ -1,0 +1,544 @@
+#!/bin/zsh
+# ==============================================================================
+# mac-cleanup - Interactive macOS System Cleanup Tool
+# Version: 1.0.0
+#
+# Usage:
+#   mac-cleanup              # Interactive cleanup mode
+#   mac-cleanup --yes        # Auto-approve all cleanups
+#   mac-cleanup --dry-run    # Show what would be cleaned without doing it
+#   mac-cleanup --diagnose   # Run diagnostic report (no cleanup)
+#   mac-cleanup --help       # Show help
+# ==============================================================================
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Tracking
+TOTAL_RECOVERED=0
+TOTAL_SKIPPED=0
+DRY_RUN=false
+AUTO_YES=false
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+print_header() {
+    echo ""
+    echo "${BLUE}${BOLD}=== $1 ===${NC}"
+}
+
+print_item() {
+    printf "  %-20s %s\n" "$1:" "$2"
+}
+
+bytes_to_human() {
+    local bytes=$1
+    if [[ $bytes -ge 1073741824 ]]; then
+        echo "$(echo "scale=1; $bytes / 1073741824" | bc) GB"
+    elif [[ $bytes -ge 1048576 ]]; then
+        echo "$(echo "scale=1; $bytes / 1048576" | bc) MB"
+    elif [[ $bytes -ge 1024 ]]; then
+        echo "$(echo "scale=1; $bytes / 1024" | bc) KB"
+    else
+        echo "$bytes B"
+    fi
+}
+
+get_dir_size_bytes() {
+    local dir="$1"
+    if [[ -d "$dir" ]]; then
+        du -sk "$dir" 2>/dev/null | awk '{print $1 * 1024}'
+    else
+        echo "0"
+    fi
+}
+
+get_dir_size_human() {
+    local dir="$1"
+    if [[ -d "$dir" ]]; then
+        du -sh "$dir" 2>/dev/null | cut -f1
+    else
+        echo "0B"
+    fi
+}
+
+confirm() {
+    local prompt="$1"
+    if [[ "$AUTO_YES" == "true" ]]; then
+        echo "${prompt} [y/N]: y (auto)"
+        return 0
+    fi
+
+    echo -n "${prompt} [y/N]: "
+    read -r response
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+success() {
+    echo "  ${GREEN}✓${NC} $1"
+}
+
+skipped() {
+    echo "  ${DIM}⊘ Skipped${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# Cleanup Functions
+# ------------------------------------------------------------------------------
+
+cleanup_trash() {
+    local trash_dir="$HOME/.Trash"
+    [[ ! -d "$trash_dir" ]] && return
+
+    local size_bytes=$(get_dir_size_bytes "$trash_dir")
+    local size_human=$(get_dir_size_human "$trash_dir")
+    local count=$(find "$trash_dir" -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+    count=$((count - 1))
+
+    [[ $count -le 0 ]] && return
+
+    print_item "Trash" "${size_human} (${count} items)"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would delete)${NC}"
+        return
+    fi
+
+    if confirm "  Clean Trash?"; then
+        rm -rf "$trash_dir"/* 2>/dev/null
+        success "Cleared ${size_human}"
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + size_bytes))
+    else
+        skipped
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + size_bytes))
+    fi
+}
+
+cleanup_user_caches() {
+    local cache_dir="$HOME/Library/Caches"
+    [[ ! -d "$cache_dir" ]] && return
+
+    local size_bytes=$(get_dir_size_bytes "$cache_dir")
+    local size_human=$(get_dir_size_human "$cache_dir")
+
+    [[ $size_bytes -lt 1048576 ]] && return  # Skip if < 1MB
+
+    print_item "User Caches" "$size_human"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would delete)${NC}"
+        return
+    fi
+
+    if confirm "  Clean User Caches?"; then
+        rm -rf "$cache_dir"/* 2>/dev/null
+        success "Cleared ${size_human}"
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + size_bytes))
+    else
+        skipped
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + size_bytes))
+    fi
+}
+
+cleanup_brew() {
+    command -v brew >/dev/null 2>&1 || return
+
+    # Get cleanup size estimate
+    local cleanup_info=$(brew cleanup --dry-run 2>/dev/null)
+    local cleanup_count=$(echo "$cleanup_info" | grep -c "Would remove" || echo "0")
+
+    # Also check brew cache
+    local cache_dir=$(brew --cache 2>/dev/null)
+    local cache_size_bytes=0
+    local cache_size_human="0B"
+    if [[ -d "$cache_dir" ]]; then
+        cache_size_bytes=$(get_dir_size_bytes "$cache_dir")
+        cache_size_human=$(get_dir_size_human "$cache_dir")
+    fi
+
+    [[ $cache_size_bytes -lt 1048576 && $cleanup_count -eq 0 ]] && return
+
+    print_item "Brew Cache" "${cache_size_human} (${cleanup_count} old versions)"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would run brew cleanup)${NC}"
+        return
+    fi
+
+    if confirm "  Clean Brew Cache?"; then
+        brew cleanup -s 2>/dev/null
+        success "Cleaned brew cache"
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + cache_size_bytes))
+    else
+        skipped
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + cache_size_bytes))
+    fi
+}
+
+cleanup_npm() {
+    command -v npm >/dev/null 2>&1 || return
+
+    local cache_dir=$(npm config get cache 2>/dev/null)
+    [[ ! -d "$cache_dir" ]] && return
+
+    local size_bytes=$(get_dir_size_bytes "$cache_dir")
+    local size_human=$(get_dir_size_human "$cache_dir")
+
+    [[ $size_bytes -lt 1048576 ]] && return
+
+    print_item "npm Cache" "$size_human"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would clean)${NC}"
+        return
+    fi
+
+    if confirm "  Clean npm Cache?"; then
+        npm cache clean --force 2>/dev/null
+        success "Cleaned npm cache"
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + size_bytes))
+    else
+        skipped
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + size_bytes))
+    fi
+}
+
+cleanup_yarn() {
+    command -v yarn >/dev/null 2>&1 || return
+
+    local cache_dir="$HOME/.yarn/cache"
+    [[ ! -d "$cache_dir" ]] && return
+
+    local size_bytes=$(get_dir_size_bytes "$cache_dir")
+    local size_human=$(get_dir_size_human "$cache_dir")
+
+    [[ $size_bytes -lt 1048576 ]] && return
+
+    print_item "Yarn Cache" "$size_human"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would clean)${NC}"
+        return
+    fi
+
+    if confirm "  Clean Yarn Cache?"; then
+        yarn cache clean 2>/dev/null
+        success "Cleaned yarn cache"
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + size_bytes))
+    else
+        skipped
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + size_bytes))
+    fi
+}
+
+cleanup_xcode() {
+    local derived_data="$HOME/Library/Developer/Xcode/DerivedData"
+    [[ ! -d "$derived_data" ]] && return
+
+    local size_bytes=$(get_dir_size_bytes "$derived_data")
+    local size_human=$(get_dir_size_human "$derived_data")
+
+    [[ $size_bytes -lt 1048576 ]] && return
+
+    print_item "Xcode DerivedData" "$size_human"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would delete)${NC}"
+        return
+    fi
+
+    if confirm "  Clean Xcode DerivedData?"; then
+        rm -rf "$derived_data"/* 2>/dev/null
+        success "Cleared ${size_human}"
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + size_bytes))
+    else
+        skipped
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + size_bytes))
+    fi
+}
+
+cleanup_simulators() {
+    command -v xcrun >/dev/null 2>&1 || return
+
+    # Check for unavailable simulators
+    local unavailable=$(xcrun simctl list devices unavailable 2>/dev/null | grep -c "unavailable" || echo "0")
+
+    [[ $unavailable -eq 0 ]] && return
+
+    local sim_cache="$HOME/Library/Developer/CoreSimulator/Caches"
+    local size_bytes=0
+    local size_human="unknown"
+    if [[ -d "$sim_cache" ]]; then
+        size_bytes=$(get_dir_size_bytes "$sim_cache")
+        size_human=$(get_dir_size_human "$sim_cache")
+    fi
+
+    print_item "iOS Simulators" "${unavailable} unavailable (cache: ${size_human})"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would delete unavailable)${NC}"
+        return
+    fi
+
+    if confirm "  Delete unavailable simulators?"; then
+        xcrun simctl delete unavailable 2>/dev/null
+        success "Removed unavailable simulators"
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + size_bytes))
+    else
+        skipped
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + size_bytes))
+    fi
+}
+
+cleanup_old_downloads() {
+    local downloads="$HOME/Downloads"
+    [[ ! -d "$downloads" ]] && return
+
+    # Find files older than 30 days
+    local old_files=$(find "$downloads" -maxdepth 1 -type f -mtime +30 2>/dev/null)
+    local count=$(echo "$old_files" | grep -c "." || echo "0")
+
+    [[ $count -eq 0 || -z "$old_files" ]] && return
+
+    # Calculate size
+    local size_bytes=0
+    while IFS= read -r file; do
+        [[ -n "$file" ]] && size_bytes=$((size_bytes + $(stat -f%z "$file" 2>/dev/null || echo 0)))
+    done <<< "$old_files"
+
+    local size_human=$(bytes_to_human $size_bytes)
+
+    print_item "Old Downloads" "${size_human} (${count} files >30 days)"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would delete)${NC}"
+        echo "$old_files" | head -5 | while read -r f; do
+            [[ -n "$f" ]] && echo "    ${DIM}$(basename "$f")${NC}"
+        done
+        [[ $count -gt 5 ]] && echo "    ${DIM}... and $((count - 5)) more${NC}"
+        return
+    fi
+
+    echo "  ${DIM}Files to delete:${NC}"
+    echo "$old_files" | head -5 | while read -r f; do
+        [[ -n "$f" ]] && echo "    $(basename "$f")"
+    done
+    [[ $count -gt 5 ]] && echo "    ... and $((count - 5)) more"
+
+    if confirm "  Delete these old downloads?"; then
+        echo "$old_files" | while read -r f; do
+            [[ -n "$f" ]] && rm -f "$f" 2>/dev/null
+        done
+        success "Deleted ${count} old files"
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + size_bytes))
+    else
+        skipped
+        TOTAL_SKIPPED=$((TOTAL_SKIPPED + size_bytes))
+    fi
+}
+
+cleanup_docker() {
+    command -v docker >/dev/null 2>&1 || return
+
+    # Check if Docker is running
+    docker info >/dev/null 2>&1 || return
+
+    # Get dangling images and stopped containers
+    local dangling=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l | tr -d ' ')
+    local stopped=$(docker ps -a -f "status=exited" -q 2>/dev/null | wc -l | tr -d ' ')
+
+    [[ $dangling -eq 0 && $stopped -eq 0 ]] && return
+
+    print_item "Docker" "${dangling} dangling images, ${stopped} stopped containers"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would prune)${NC}"
+        return
+    fi
+
+    if confirm "  Prune Docker?"; then
+        docker system prune -f 2>/dev/null
+        success "Pruned Docker"
+    else
+        skipped
+    fi
+}
+
+flush_dns() {
+    print_item "DNS Cache" "flush"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would flush)${NC}"
+        return
+    fi
+
+    if confirm "  Flush DNS Cache?"; then
+        sudo dscacheutil -flushcache 2>/dev/null
+        sudo killall -HUP mDNSResponder 2>/dev/null
+        success "DNS cache flushed"
+    else
+        skipped
+    fi
+}
+
+run_maintenance() {
+    print_item "System Maintenance" "daily/weekly/monthly scripts"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: would run periodic scripts)${NC}"
+        return
+    fi
+
+    if confirm "  Run system maintenance?"; then
+        sudo periodic daily weekly monthly 2>/dev/null
+        success "Maintenance scripts executed"
+    else
+        skipped
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Diagnose Mode (from original health_suite)
+# ------------------------------------------------------------------------------
+
+run_diagnose() {
+    SCRIPT_DIR="${0:A:h}"
+
+    if [[ -f "$SCRIPT_DIR/health_suite/health_check" ]]; then
+        exec "$SCRIPT_DIR/health_suite/health_check" "$@"
+    else
+        echo "${RED}Error: health_suite not found${NC}"
+        echo "Diagnose mode requires the health_suite directory"
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Help
+# ------------------------------------------------------------------------------
+
+show_help() {
+    cat << EOF
+${BOLD}mac-cleanup${NC} v${VERSION} - Interactive macOS System Cleanup
+
+${CYAN}USAGE:${NC}
+    mac-cleanup [OPTIONS]
+
+${CYAN}OPTIONS:${NC}
+    ${BOLD}--yes, -y${NC}        Auto-approve all cleanups (no prompts)
+    ${BOLD}--dry-run, -n${NC}    Show what would be cleaned without doing it
+    ${BOLD}--diagnose, -d${NC}   Run diagnostic health report (no cleanup)
+    ${BOLD}--help, -h${NC}       Show this help message
+    ${BOLD}--version, -v${NC}    Show version
+
+${CYAN}CLEANUP CATEGORIES:${NC}
+    - Trash
+    - User Caches (~/Library/Caches)
+    - Homebrew cache and old versions
+    - npm/yarn cache
+    - Xcode DerivedData
+    - Unavailable iOS Simulators
+    - Old Downloads (>30 days)
+    - Docker dangling images/containers
+    - DNS cache flush
+    - System maintenance scripts
+
+${CYAN}EXAMPLES:${NC}
+    mac-cleanup              # Interactive mode
+    mac-cleanup -y           # Clean everything automatically
+    mac-cleanup -n           # Preview what would be cleaned
+    mac-cleanup -d           # Health diagnosis only
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            --version|-v)
+                echo "mac-cleanup v${VERSION}"
+                exit 0
+                ;;
+            --yes|-y)
+                AUTO_YES=true
+                shift
+                ;;
+            --dry-run|-n)
+                DRY_RUN=true
+                shift
+                ;;
+            --diagnose|-d)
+                shift
+                run_diagnose "$@"
+                exit 0
+                ;;
+            *)
+                echo "${RED}Unknown option: $1${NC}"
+                echo "Run 'mac-cleanup --help' for usage"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Header
+    echo ""
+    echo "${BOLD}${CYAN}mac-cleanup${NC} v${VERSION}"
+    [[ "$DRY_RUN" == "true" ]] && echo "${YELLOW}(dry-run mode)${NC}"
+    echo ""
+    echo "${DIM}Scanning system...${NC}"
+
+    # Run all cleanups
+    print_header "Storage"
+    cleanup_trash
+    cleanup_user_caches
+    cleanup_brew
+    cleanup_npm
+    cleanup_yarn
+    cleanup_xcode
+    cleanup_simulators
+    cleanup_old_downloads
+    cleanup_docker
+
+    print_header "System"
+    flush_dns
+    run_maintenance
+
+    # Summary
+    print_header "Summary"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  ${DIM}(dry-run: no changes made)${NC}"
+    else
+        local recovered_human=$(bytes_to_human $TOTAL_RECOVERED)
+        local skipped_human=$(bytes_to_human $TOTAL_SKIPPED)
+
+        echo "  ${GREEN}Recovered:${NC}  ${recovered_human}"
+        echo "  ${DIM}Skipped:${NC}    ${skipped_human}"
+    fi
+
+    echo ""
+    echo "${GREEN}Done!${NC}"
+}
+
+main "$@"
